@@ -1,3 +1,3 @@
 # kubernetes-resources
 
-kubectl get nodes | grep -i address -A
+kubectl describe nodes | grep -i address -A
