@@ -8,3 +8,27 @@ Configuration file will be checked in the following order.
 3.~/.ansible.cfg (in the home directory)
 
 4./etc/ansible/ansible.cfg
+
+To 
+
+Ansible patterns 
+
+To call all the hosts
+ansible --list-hosts "*" 
+
+To call specific groups 
+
+ansible --list-hosts group1:group2
+
+To call all the groups except certain group
+
+ansible --list-hosts \!group-name
+
+To call specific host in a group
+
+ansible --list-hosts group[0] (0,1,..) 
+
+
+
+
+
