@@ -1,0 +1,10 @@
+
+Configuration file will be checked in the following order.
+
+1.ANSIBLE_CONFIG (environment variable)
+
+2.ansible.cfg (in the current directory)
+
+3.~/.ansible.cfg (in the home directory)
+
+4./etc/ansible/ansible.cfg
