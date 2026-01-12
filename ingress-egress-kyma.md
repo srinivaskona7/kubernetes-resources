@@ -10,6 +10,8 @@ A comprehensive documentation guide for configuring Ingress (incoming) and Egres
 2. [Understanding Traffic Flow](#2-understanding-traffic-flow)
 3. [Ingress Policies](#3-ingress-policies-restricting-incoming-traffic)
 4. [Egress Policies](#4-egress-policies-restricting-outgoing-traffic)
+   - [4.7 ServiceEntry with IP Addresses](#47-serviceentry-with-ip-addresses)
+   - [4.8 Kubernetes NetworkPolicy vs. Istio Policies](#48-kubernetes-networkpolicy-vs-istio-policies)
 5. [ExternalTrafficPolicy Deep Dive](#5-externaltrafficpolicy-deep-dive)
 6. [NATS Messaging in Kyma](#6-nats-messaging-in-kyma)
 7. [AWS Load Balancer Considerations](#7-aws-load-balancer-considerations)
@@ -411,6 +413,286 @@ spec:
 | `outboundTrafficPolicy` | `ALLOW_ANY` | `REGISTRY_ONLY` | Block unknown external destinations |
 | External URLs | All accessible | Only ServiceEntry hosts | Prevent data exfiltration |
 | Unknown destinations | Permitted | Return 502/503 | Security - deny unknown targets |
+
+---
+
+## 4.7 ServiceEntry with IP Addresses
+
+When the external service doesn't have a DNS name (e.g., a database or legacy system), you can use IP addresses directly in ServiceEntry.
+
+### Synthetic Host (Mandatory but Non-Functional)
+
+> [!IMPORTANT]
+> **The `hosts` field is MANDATORY** in ServiceEntry, even when using IP addresses. However, this hostname is **NOT functional** for routing - it's only used as an identifier within the Istio mesh registry. The actual traffic is routed based on the `addresses` field.
+
+| Field | Purpose | Required | Functional for Routing? |
+|-------|---------|----------|------------------------|
+| `hosts` | Mesh registry identifier | ✅ Mandatory | ❌ No (synthetic/arbitrary) |
+| `addresses` | Actual IP(s) for traffic | ✅ For IP-based routing | ✅ Yes |
+| `endpoints` | Target IPs for load balancing | ✅ For `STATIC` resolution | ✅ Yes |
+
+### Example 1: Single IP Address (Database Server)
+
+```yaml
+# egress/external-database.yaml
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: external-database
+  namespace: istio-system
+  labels:
+    managed-by: network-policies
+spec:
+  # ⚠️ MANDATORY: Arbitrary hostname - used ONLY as mesh registry identifier
+  # This hostname is NOT used for actual DNS resolution or routing
+  # You can use any naming convention, e.g., "service-name.internal"
+  hosts:
+    - external-db.internal         # Synthetic domain (pick any name you want)
+  
+  # ✅ ACTUAL ROUTING: Traffic matching this IP will be allowed
+  addresses:
+    - 203.0.113.50/32              # The real IP address of the database
+  
+  ports:
+    - number: 5432
+      name: postgres
+      protocol: TCP
+  
+  location: MESH_EXTERNAL          # Outside the mesh
+  
+  # ✅ Use STATIC when providing explicit IP addresses
+  # STATIC = use endpoints for routing (DNS is not queried)
+  resolution: STATIC
+  
+  # ✅ Required for STATIC resolution - the actual target IPs
+  endpoints:
+    - address: 203.0.113.50        # Where traffic is actually sent
+
+  exportTo:
+    - "*"                          # Cluster-wide visibility
+```
+
+### Example 2: IP Range (CIDR Block)
+
+```yaml
+# egress/corporate-network.yaml
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: corporate-network
+  namespace: istio-system
+  labels:
+    managed-by: network-policies
+spec:
+  # ⚠️ MANDATORY: Synthetic hostname (not functional)
+  hosts:
+    - "*.corp.internal"            # Arbitrary - won't be used for routing
+  
+  # ✅ ACTUAL ROUTING: Allow access to entire subnet
+  addresses:
+    - 10.100.0.0/16                # Corporate network CIDR
+  
+  ports:
+    - number: 443
+      name: https
+      protocol: HTTPS
+    - number: 80
+      name: http
+      protocol: HTTP
+  
+  location: MESH_EXTERNAL
+  
+  # ✅ Use NONE for CIDR - let the network handle routing
+  # NONE = passthrough, don't intercept or resolve
+  resolution: NONE                 # No endpoints needed for CIDR
+  
+  exportTo:
+    - "*"
+```
+
+### Example 3: Multiple IP Addresses (Load Balanced)
+
+```yaml
+# egress/legacy-api-servers.yaml
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: legacy-api-servers
+  namespace: istio-system
+  labels:
+    managed-by: network-policies
+spec:
+  # ⚠️ MANDATORY: Synthetic hostname for mesh registration
+  hosts:
+    - legacy-api.internal          # Identifier only - not used for routing
+  
+  # ✅ ACTUAL ROUTING: All these IPs are allowed
+  addresses:
+    - 192.168.1.10/32
+    - 192.168.1.11/32
+    - 192.168.1.12/32
+  
+  ports:
+    - number: 8080
+      name: http
+      protocol: HTTP
+  
+  location: MESH_EXTERNAL
+  resolution: STATIC
+  
+  # ✅ Endpoints for load balancing across multiple IPs
+  endpoints:
+    - address: 192.168.1.10
+      weight: 33                   # Optional: load balancing weight
+    - address: 192.168.1.11
+      weight: 33
+    - address: 192.168.1.12
+      weight: 34
+  
+  exportTo:
+    - "*"
+```
+
+### Resolution Modes Comparison
+
+| `resolution` | When to Use | `addresses` | `endpoints` | DNS Lookup |
+|--------------|-------------|-------------|-------------|------------|
+| `DNS` | Hostname-based (normal) | Optional | Not needed | ✅ Yes |
+| `STATIC` | IP-based routing | Required | Required | ❌ No |
+| `NONE` | CIDR/passthrough | Required | Not needed | ❌ No |
+
+> [!TIP]
+> **Naming Convention**: Use a consistent pattern for synthetic hostnames, such as:
+> - `<service-name>.internal` (e.g., `legacy-db.internal`)
+> - `<service-name>.external` (e.g., `payments-api.external`)
+> - `<ip-address>.ip.local` (e.g., `192-168-1-10.ip.local`)
+
+---
+
+## 4.8 Kubernetes NetworkPolicy vs. Istio Policies
+
+### What is Kubernetes NetworkPolicy?
+
+Kubernetes NetworkPolicy is a **native K8s resource** for controlling pod-to-pod traffic at the network layer (L3/L4). It requires a CNI plugin (like Calico or Cilium) that supports NetworkPolicy.
+
+### Comparison: Istio vs. Kubernetes NetworkPolicy
+
+| Aspect | Kubernetes NetworkPolicy | Istio Policies (AuthorizationPolicy, Sidecar) |
+|--------|--------------------------|----------------------------------------------|
+| **Layer** | L3/L4 (IP, port, protocol) | L7 (HTTP headers, paths, methods, JWT) |
+| **Scope** | Pod-to-pod, namespace | Service mesh traffic (including external) |
+| **Encryption** | None | mTLS automatic |
+| **Requires** | CNI plugin (Calico, Cilium) | Istio sidecar injection |
+| **External traffic** | Limited (ingress only) | Full control (ingress + egress) |
+| **Observability** | None | Full tracing, metrics |
+
+### Example: Kubernetes NetworkPolicy
+
+```yaml
+# k8s-network-policy/deny-all-egress.yaml
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-egress
+  namespace: garden
+spec:
+  podSelector: {}                  # All pods in namespace
+  policyTypes:
+    - Egress
+  egress: []                       # No egress allowed (empty = deny all)
+
+---
+# Allow only specific egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-and-internal
+  namespace: garden
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow internal cluster traffic
+    - to:
+        - podSelector: {}          # Same namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+```
+
+### Verdict: Do You Need Kubernetes NetworkPolicy in Kyma?
+
+> [!NOTE]
+> **Short Answer: Usually NO** - Istio policies are sufficient and more powerful for most use cases in Kyma.
+
+| Scenario | NetworkPolicy Needed? | Why |
+|----------|----------------------|-----|
+| Standard Kyma workloads | ❌ No | Istio AuthorizationPolicy + Sidecar covers L7 |
+| Pods without Istio sidecar | ✅ Yes | No Envoy = no Istio policy enforcement |
+| Defense-in-depth compliance | ✅ Optional | Some audits require both layers |
+| Non-HTTP protocols (raw TCP) | ⚠️ Maybe | Istio handles TCP, but NetworkPolicy adds L3 layer |
+| Multi-tenant strict isolation | ✅ Recommended | Extra layer for namespace isolation |
+
+### When to Use Both (Defense in Depth)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        DEFENSE IN DEPTH: Both Layers                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  External Traffic
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Kubernetes NetworkPolicy   │  ◄── L3/L4: IP/Port filtering
+  │  (Calico/Cilium CNI)        │      Blocks traffic before it reaches pod
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │  Istio AuthorizationPolicy  │  ◄── L7: HTTP method, path, headers
+  │  (Envoy Sidecar)            │      Fine-grained access control
+  └─────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────┐
+  │        Your Pod              │
+  └─────────────────────────────┘
+```
+
+### Final Recommendation for Kyma
+
+| Environment | Recommendation |
+|-------------|----------------|
+| **Development** | Istio only (simpler) |
+| **Production (standard)** | Istio only (sufficient) |
+| **Production (regulated/compliance)** | Both Istio + NetworkPolicy |
+| **Multi-tenant cluster** | Both (namespace isolation) |
+
+> [!CAUTION]
+> **Kyma CNI Limitation**: SAP BTP Kyma uses a managed Kubernetes cluster. The CNI may or may not support NetworkPolicy depending on the underlying infrastructure. Check with `kubectl get nodes -o wide` and verify CNI plugin before relying on NetworkPolicy.
+
+```bash
+# Check if NetworkPolicy is supported
+kubectl get networkpolicies -A
+
+# If no errors and you can create policies, CNI supports it
+# If you get errors or policies don't take effect, CNI doesn't support it
+```
 
 ---
 
